@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 1 - Monitoring Stack
+  Creates SNS topic, CloudWatch alarms for all components,
+  a unified CloudWatch dashboard, and log groups.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: project1-webapp
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive CloudWatch alarm notifications
+    AllowedPattern: '^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+
+Resources:
+
+  # ─── SNS TOPIC ──────────────────────────────────────────────────────────────
+  AlertSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts'
+      DisplayName: !Sub '${ProjectName} Infrastructure Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alerts-topic'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AlertSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertSNSTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ─── LOG GROUPS ─────────────────────────────────────────────────────────────
+  NginxAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}/nginx/access'
+      RetentionInDays: 30
+
+  NginxErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}/nginx/error'
+      RetentionInDays: 30
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}/application'
+      RetentionInDays: 14
+
+  UserDataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ec2/${ProjectName}/user-data'
+      RetentionInDays: 7
+
+  # ─── EC2 / ASG ALARMS ───────────────────────────────────────────────────────
+  ASGHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-asg-high-cpu-alert'
+      AlarmDescription: ASG average CPU utilization > 70% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value:
+            Fn::ImportValue: !Sub '${ProjectName}-ASGName'
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      OKActions:
+        - !Ref AlertSNSTopic
+      TreatMissingData: notBreaching
+
+  ASGLowHealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-low-healthy-hosts'
+      AlarmDescription: ALB healthy host count dropped below 2
+      MetricName: HealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      OKActions:
+        - !Ref AlertSNSTopic
+      TreatMissingData: breaching
+
+  # ─── ALB ALARMS ─────────────────────────────────────────────────────────────
+  ALBHighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-high-latency'
+      AlarmDescription: ALB target response time > 2 seconds
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Statistic: p99
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      OKActions:
+        - !Ref AlertSNSTopic
+      TreatMissingData: notBreaching
+
+  ALBHigh5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-high-5xx-errors'
+      AlarmDescription: ALB 5xx error rate > 5% for 5 minutes
+      Metrics:
+        - Id: requests
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: RequestCount
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+        - Id: errors5xx
+          MetricStat:
+            Metric:
+              Namespace: AWS/ApplicationELB
+              MetricName: HTTPCode_Target_5XX_Count
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+        - Id: errorRate
+          Expression: '(errors5xx / requests) * 100'
+          ReturnData: true
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 2
+      Threshold: 5
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      OKActions:
+        - !Ref AlertSNSTopic
+      TreatMissingData: notBreaching
+
+  ALBHigh4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-high-4xx-errors'
+      AlarmDescription: ALB 4xx error rate > 10% for 5 minutes
+      MetricName: HTTPCode_Target_4XX_Count
+      Namespace: AWS/ApplicationELB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      TreatMissingData: notBreaching
+
+  # ─── RDS ALARMS ─────────────────────────────────────────────────────────────
+  RDSHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-high-cpu-alert'
+      AlarmDescription: RDS CPU utilization > 80%
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value:
+            Fn::ImportValue: !Sub '${ProjectName}-DBInstanceId'
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      OKActions:
+        - !Ref AlertSNSTopic
+      TreatMissingData: notBreaching
+
+  RDSLowFreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-low-storage-alert'
+      AlarmDescription: RDS free storage space < 5GB
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5368709120
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value:
+            Fn::ImportValue: !Sub '${ProjectName}-DBInstanceId'
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      TreatMissingData: notBreaching
+
+  RDSHighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-high-connections-alert'
+      AlarmDescription: RDS database connections > 400
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 400
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value:
+            Fn::ImportValue: !Sub '${ProjectName}-DBInstanceId'
+      AlarmActions:
+        - !Ref AlertSNSTopic
+      TreatMissingData: notBreaching
+
+  # ─── CLOUDWATCH DASHBOARD ───────────────────────────────────────────────────
+  MainDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-main-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": {
+                "markdown": "# ${ProjectName} - Production Infrastructure Dashboard\n**Last Updated:** Auto-refresh every 1 minute"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "ASG - CPU Utilization",
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${ProjectName}-asg", {"stat": "Average", "label": "Avg CPU"}],
+                  ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${ProjectName}-asg", {"stat": "Maximum", "label": "Max CPU"}]
+                ],
+                "period": 60,
+                "view": "timeSeries",
+                "yAxis": {"left": {"min": 0, "max": 100}},
+                "annotations": {"horizontal": [{"value": 70, "label": "Alert Threshold", "color": "#ff6961"}]}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "ALB - Request Count & Error Rates",
+                "metrics": [
+                  ["AWS/ApplicationELB", "RequestCount", {"stat": "Sum", "label": "Total Requests"}],
+                  ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", {"stat": "Sum", "label": "5xx Errors", "color": "#d62728"}],
+                  ["AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", {"stat": "Sum", "label": "4xx Errors", "color": "#ff7f0e"}]
+                ],
+                "period": 60,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "ALB - Response Time (ms)",
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime", {"stat": "Average", "label": "Avg Response Time"}],
+                  ["AWS/ApplicationELB", "TargetResponseTime", {"stat": "p99", "label": "p99 Response Time"}]
+                ],
+                "period": 60,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "ASG - Instance Count",
+                "metrics": [
+                  ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${ProjectName}-asg", {"stat": "Average", "label": "In Service"}],
+                  ["AWS/AutoScaling", "GroupPendingInstances", "AutoScalingGroupName", "${ProjectName}-asg", {"stat": "Average", "label": "Pending"}],
+                  ["AWS/AutoScaling", "GroupTerminatingInstances", "AutoScalingGroupName", "${ProjectName}-asg", {"stat": "Average", "label": "Terminating"}]
+                ],
+                "period": 60,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "RDS - CPU & Connections",
+                "metrics": [
+                  ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "${ProjectName}-db", {"stat": "Average", "label": "RDS CPU %"}],
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${ProjectName}-db", {"stat": "Average", "yAxis": "right", "label": "DB Connections"}]
+                ],
+                "period": 60,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "RDS - Storage & Memory",
+                "metrics": [
+                  ["AWS/RDS", "FreeStorageSpace", "DBInstanceIdentifier", "${ProjectName}-db", {"stat": "Average", "label": "Free Storage (bytes)"}],
+                  ["AWS/RDS", "FreeableMemory", "DBInstanceIdentifier", "${ProjectName}-db", {"stat": "Average", "label": "Freeable Memory"}]
+                ],
+                "period": 300,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0, "y": 13, "width": 12, "height": 6,
+              "properties": {
+                "title": "Active Alarms",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-asg-high-cpu-alert",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-alb-high-latency",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-alb-high-5xx-errors",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-alb-low-healthy-hosts",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-rds-high-cpu-alert",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${ProjectName}-rds-low-storage-alert"
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  SNSTopicArn:
+    Value: !Ref AlertSNSTopic
+    Export:
+      Name: !Sub '${ProjectName}-AlertSNSTopicArn'
+
+  DashboardURL:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=${ProjectName}-main-dashboard'
+    Description: Link to the CloudWatch dashboard

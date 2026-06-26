@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 1 - CloudFront Distribution Stack
+  Creates a CloudFront distribution in front of the ALB with custom cache
+  behaviors for static assets and a separate origin for the API.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: project1-webapp
+
+  WAFWebACLArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the WAF WebACL to associate with CloudFront.
+      Must be a CLOUDFRONT scope WAF (us-east-1). Leave empty to skip.
+
+Conditions:
+  HasCloudFrontWAF: !Not [!Equals [!Ref WAFWebACLArn, '']]
+
+Resources:
+
+  # ─── CLOUDFRONT ORIGIN ACCESS IDENTITY (for S3 static assets) ───────────────
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub '${ProjectName} OAI for static assets'
+
+  # ─── S3 BUCKET FOR STATIC ASSETS ────────────────────────────────────────────
+  StaticAssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-static-assets-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-static-assets'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  StaticAssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticAssetsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAI
+            Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${StaticAssetsBucket}/*'
+
+  # ─── CLOUDFRONT CACHE POLICIES ──────────────────────────────────────────────
+  StaticAssetsCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${ProjectName}-static-cache-policy'
+        DefaultTTL: 86400
+        MaxTTL: 31536000
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: whitelist
+            QueryStrings:
+              - v
+              - version
+
+  DynamicContentCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub '${ProjectName}-dynamic-cache-policy'
+        DefaultTTL: 0
+        MaxTTL: 31536000
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: all
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: false
+          HeadersConfig:
+            HeaderBehavior: whitelist
+            Headers:
+              - Authorization
+              - Host
+              - CloudFront-Forwarded-Proto
+          QueryStringsConfig:
+            QueryStringBehavior: all
+
+  # ─── CLOUDFRONT ORIGIN REQUEST POLICY ───────────────────────────────────────
+  ALBOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub '${ProjectName}-alb-origin-request-policy'
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allViewer
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+  # ─── CLOUDFRONT DISTRIBUTION ─────────────────────────────────────────────────
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName} - Web App CDN Distribution'
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        WebACLId: !If [HasCloudFrontWAF, !Ref WAFWebACLArn, !Ref 'AWS::NoValue']
+
+        # Origins
+        Origins:
+          # ALB Origin (dynamic content)
+          - Id: ALBOrigin
+            DomainName:
+              Fn::ImportValue: !Sub '${ProjectName}-ALBDNSName'
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols: [TLSv1.2]
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+            OriginCustomHeaders:
+              - HeaderName: X-Custom-Origin-Header
+                HeaderValue: !Sub '${ProjectName}-cloudfront'
+
+          # S3 Origin (static assets)
+          - Id: S3StaticOrigin
+            DomainName: !GetAtt StaticAssetsBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+
+        # Default behavior → ALB (dynamic content, no caching)
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: !Ref DynamicContentCachePolicy
+          OriginRequestPolicyId: !Ref ALBOriginRequestPolicy
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          ResponseHeadersPolicyId: 60a44d5b-6fac-4ce7-b95c-f5ad20e94d58  # AWS SecurityHeadersPolicy
+
+        # Cache behaviors
+        CacheBehaviors:
+          # Static assets from S3 (/static/*)
+          - PathPattern: /static/*
+            TargetOriginId: S3StaticOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+
+          # Images (/images/*)
+          - PathPattern: /images/*
+            TargetOriginId: S3StaticOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+
+          # CSS / JS assets
+          - PathPattern: /assets/*
+            TargetOriginId: S3StaticOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: !Ref StaticAssetsCachePolicy
+            AllowedMethods: [GET, HEAD]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+
+          # API traffic → ALB with no caching
+          - PathPattern: /api/*
+            TargetOriginId: ALBOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            CachePolicyId: !Ref DynamicContentCachePolicy
+            OriginRequestPolicyId: !Ref ALBOriginRequestPolicy
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            Compress: true
+
+        # Geo restriction - none
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+
+        # Custom error pages
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /errors/404.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 500
+            ResponseCode: 500
+            ResponsePagePath: /errors/500.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 503
+            ResponseCode: 503
+            ResponsePagePath: /errors/503.html
+            ErrorCachingMinTTL: 10
+
+        # Logging
+        Logging:
+          Bucket: !GetAtt StaticAssetsBucket.DomainName
+          Prefix: cloudfront-logs/
+          IncludeCookies: false
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cloudfront'
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  CloudFrontDistributionId:
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${ProjectName}-CloudFrontDistributionId'
+
+  CloudFrontDomainName:
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${ProjectName}-CloudFrontDomainName'
+
+  StaticAssetsBucketName:
+    Value: !Ref StaticAssetsBucket
+    Export:
+      Name: !Sub '${ProjectName}-StaticAssetsBucketName'

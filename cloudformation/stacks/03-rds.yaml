@@ -1,0 +1,246 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 1 - RDS Multi-AZ Stack
+  Deploys a MySQL RDS instance in Multi-AZ mode with automated backups,
+  encryption at rest, and a dedicated subnet group in private DB subnets.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: project1-webapp
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.r6g.large
+      - db.r6g.xlarge
+
+  DBEngine:
+    Type: String
+    Default: mysql
+    AllowedValues: [mysql, postgres]
+
+  DBEngineVersion:
+    Type: String
+    Default: '8.0'
+
+  DBName:
+    Type: String
+    Default: appdb
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+
+  DBMasterUsername:
+    Type: String
+    Default: admin
+    NoEcho: false
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    Description: Must be at least 8 characters
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 65536
+
+  DBBackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+
+  MultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Resources:
+
+  # ─── DB SUBNET GROUP ────────────────────────────────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for RDS across 2 AZs
+      SubnetIds:
+        - Fn::ImportValue: !Sub '${ProjectName}-PrivateDbSubnet1Id'
+        - Fn::ImportValue: !Sub '${ProjectName}-PrivateDbSubnet2Id'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ─── DB PARAMETER GROUP ─────────────────────────────────────────────────────
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: !Sub '${ProjectName}-db-params'
+      Description: Custom parameter group for MySQL 8.0
+      Family: mysql8.0
+      Parameters:
+        slow_query_log: '1'
+        long_query_time: '2'
+        log_output: FILE
+        max_connections: '500'
+        innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-params'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ─── KMS KEY FOR RDS ENCRYPTION ─────────────────────────────────────────────
+  RDSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${ProjectName} RDS encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow RDS Service
+            Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-kms-key'
+
+  RDSEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-rds'
+      TargetKeyId: !Ref RDSEncryptionKey
+
+  # ─── RDS INSTANCE ───────────────────────────────────────────────────────────
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db'
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: !Ref DBEngine
+      EngineVersion: !Ref DBEngineVersion
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !Ref RDSEncryptionKey
+      MultiAZ: !Ref MultiAZ
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DBParameterGroupName: !Ref DBParameterGroup
+      VPCSecurityGroups:
+        - Fn::ImportValue: !Sub '${ProjectName}-RDSSecurityGroupId'
+      BackupRetentionPeriod: !Ref DBBackupRetentionDays
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:05:00-sun:06:00'
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: true
+      EnableCloudwatchLogsExports:
+        - error
+        - slowquery
+        - general
+      PubliclyAccessible: false
+      CopyTagsToSnapshot: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ─── CLOUDWATCH ALARMS FOR RDS ──────────────────────────────────────────────
+  RDSCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-high-cpu'
+      AlarmDescription: RDS CPU utilization > 80%
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+
+  RDSFreeStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-low-storage'
+      AlarmDescription: RDS free storage < 5GB
+      MetricName: FreeStorageSpace
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5000000000
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+
+  RDSConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-rds-high-connections'
+      AlarmDescription: RDS database connections > 400
+      MetricName: DatabaseConnections
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 400
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref DBInstance
+
+Outputs:
+  DBInstanceId:
+    Value: !Ref DBInstance
+    Export:
+      Name: !Sub '${ProjectName}-DBInstanceId'
+
+  DBEndpointAddress:
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-DBEndpointAddress'
+
+  DBEndpointPort:
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${ProjectName}-DBEndpointPort'
+
+  DBName:
+    Value: !Ref DBName
+    Export:
+      Name: !Sub '${ProjectName}-DBName'

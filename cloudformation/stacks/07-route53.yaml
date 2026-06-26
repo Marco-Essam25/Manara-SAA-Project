@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Project 1 - Route 53 Stack
+  Creates a hosted zone, Alias A record pointing to ALB, health checks,
+  and a CNAME for the CloudFront distribution.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: project1-webapp
+
+  DomainName:
+    Type: String
+    Description: >
+      The root domain name (e.g. example.com).
+      A public hosted zone will be created for this domain.
+
+  SubDomain:
+    Type: String
+    Default: www
+    Description: Subdomain prefix (e.g. www → www.example.com)
+
+  CreateCloudFrontRecord:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create a cdn.{DomainName} CNAME to CloudFront
+
+Conditions:
+  CreateCDNRecord: !Equals [!Ref CreateCloudFrontRecord, 'true']
+
+Resources:
+
+  # ─── PUBLIC HOSTED ZONE ─────────────────────────────────────────────────────
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub 'Hosted zone for ${ProjectName} - ${DomainName}'
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-hosted-zone'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ─── ALB HEALTH CHECK ───────────────────────────────────────────────────────
+  ALBHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTPS
+        FullyQualifiedDomainName:
+          Fn::ImportValue: !Sub '${ProjectName}-ALBDNSName'
+        Port: 443
+        ResourcePath: /health
+        RequestInterval: 30
+        FailureThreshold: 3
+        EnableSNI: true
+        Regions:
+          - us-east-1
+          - eu-west-1
+          - ap-southeast-1
+      HealthCheckTags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-health-check'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ─── A RECORD → ALB (Alias) ─────────────────────────────────────────────────
+  ALBAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${SubDomain}.${DomainName}.'
+      Type: A
+      AliasTarget:
+        DNSName:
+          Fn::ImportValue: !Sub '${ProjectName}-ALBDNSName'
+        EvaluateTargetHealth: true
+        HostedZoneId:
+          Fn::ImportValue: !Sub '${ProjectName}-ALBHostedZoneId'
+
+  # ─── AAAA (IPv6) RECORD → ALB (Alias) ───────────────────────────────────────
+  ALBAliasRecordIPv6:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${SubDomain}.${DomainName}.'
+      Type: AAAA
+      AliasTarget:
+        DNSName:
+          Fn::ImportValue: !Sub '${ProjectName}-ALBDNSName'
+        EvaluateTargetHealth: true
+        HostedZoneId:
+          Fn::ImportValue: !Sub '${ProjectName}-ALBHostedZoneId'
+
+  # ─── APEX DOMAIN → ALB (Alias) ──────────────────────────────────────────────
+  ApexAliasRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${DomainName}.'
+      Type: A
+      AliasTarget:
+        DNSName:
+          Fn::ImportValue: !Sub '${ProjectName}-ALBDNSName'
+        EvaluateTargetHealth: true
+        HostedZoneId:
+          Fn::ImportValue: !Sub '${ProjectName}-ALBHostedZoneId'
+
+  # ─── CLOUDFRONT CNAME RECORD ─────────────────────────────────────────────────
+  CloudFrontCNAMERecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateCDNRecord
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub 'cdn.${DomainName}.'
+      Type: CNAME
+      TTL: 300
+      ResourceRecords:
+        - Fn::ImportValue: !Sub '${ProjectName}-CloudFrontDomainName'
+
+  # ─── CLOUDWATCH ALARM FOR HEALTH CHECK ──────────────────────────────────────
+  HealthCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-alb-health-check-failed'
+      AlarmDescription: Route53 health check for ALB failed
+      MetricName: HealthCheckStatus
+      Namespace: AWS/Route53
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: HealthCheckId
+          Value: !Ref ALBHealthCheck
+
+Outputs:
+  HostedZoneId:
+    Value: !Ref HostedZone
+    Export:
+      Name: !Sub '${ProjectName}-HostedZoneId'
+
+  HostedZoneNameServers:
+    Value: !Join [', ', !GetAtt HostedZone.NameServers]
+    Description: Update your domain registrar with these name servers
+
+  WebAppURL:
+    Value: !Sub 'https://${SubDomain}.${DomainName}'
+    Export:
+      Name: !Sub '${ProjectName}-WebAppURL'
+
+  CDNUrl:
+    Condition: CreateCDNRecord
+    Value: !Sub 'https://cdn.${DomainName}'
+    Export:
+      Name: !Sub '${ProjectName}-CDNUrl'
